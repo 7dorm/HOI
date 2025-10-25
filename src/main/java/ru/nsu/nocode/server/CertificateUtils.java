@@ -60,6 +60,26 @@ public class CertificateUtils {
         return gen.generateKeyPair();
     }
 
+    public static KeyPair generateECKeyPair(String curve) throws Exception {
+        KeyPairGenerator gen = KeyPairGenerator.getInstance("EC");
+        gen.initialize(new java.security.spec.ECGenParameterSpec(curve));
+        return gen.generateKeyPair();
+    }
+
+    public static X509Certificate buildECCertificate(String cn, PublicKey pub, PrivateKey issuerKey, String issuerDN) throws Exception {
+        X500Name issuer = new X500Name(issuerDN);
+        X500Name subject = new X500Name("CN=" + cn);
+        BigInteger serial = new BigInteger(160, new SecureRandom());
+        Date notBefore = new Date(System.currentTimeMillis() - 60000);
+        Date notAfter = new Date(System.currentTimeMillis() + 365L * 24 * 3600 * 1000);
+
+        var builder = new JcaX509v3CertificateBuilder(issuer, serial, notBefore, notAfter, subject, pub);
+        ContentSigner signer = new JcaContentSignerBuilder("SHA256withECDSA").setProvider("BC").build(issuerKey);
+
+        return new JcaX509CertificateConverter().setProvider("BC")
+                .getCertificate(builder.build(signer));
+    }
+
     public static String toPem(Object obj) throws IOException {
         StringWriter sw = new StringWriter();
         try (JcaPEMWriter w = new JcaPEMWriter(sw)) {

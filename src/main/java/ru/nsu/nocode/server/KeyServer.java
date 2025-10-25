@@ -11,8 +11,16 @@ import java.security.cert.X509Certificate;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class KeyServer {
+    private static final Logger logger = LoggerFactory.getLogger(KeyServer.class);
+    private static final int MAX_NAME_LENGTH = 255;
+    private static final int MAX_CACHE_SIZE = 1000;
+    private static final long CACHE_TTL_MS = 300_000; // 5 minutes
+    
     private final int port;
     private final int genThreads;
     private final PrivateKey issuerKey;
@@ -20,12 +28,20 @@ public class KeyServer {
     private final Selector selector;
     private final ServerSocketChannel serverChannel;
     private final ExecutorService pool;
-    private final ConcurrentHashMap<String, CompletableFuture<PairPem>> cache = new ConcurrentHashMap<>();
+    private final Map<String, CacheEntry> cache = Collections.synchronizedMap(new LinkedHashMap<String, CacheEntry>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
+            return size() > MAX_CACHE_SIZE;
+        }
+    });
     private final ConcurrentLinkedQueue<ClientConnection> readyToWrite = new ConcurrentLinkedQueue<>();
     private final AtomicBoolean running = new AtomicBoolean(true);
+    private final AtomicInteger activeTasks = new AtomicInteger(0);
+    private final AtomicInteger completedTasks = new AtomicInteger(0);
+    private PoolMonitor poolMonitor;
 
     public void shutdown() {
-        System.out.println("Shutting down KeyServer...");
+        logger.info("Shutting down KeyServer...");
 
         running.set(false);
 
@@ -36,39 +52,58 @@ public class KeyServer {
         try {
             if (serverChannel != null && serverChannel.isOpen()) {
                 serverChannel.close();
-                System.out.println("Server socket closed.");
+                logger.info("Server socket closed.");
             }
         } catch (IOException e) {
-            System.err.println("Error closing server socket: " + e.getMessage());
+            logger.error("Error closing server socket: {}", e.getMessage());
         }
 
         try {
             if (selector != null && selector.isOpen()) {
                 selector.close();
-                System.out.println("Selector closed.");
+                logger.info("Selector closed.");
             }
         } catch (IOException e) {
-            System.err.println("Error closing selector: " + e.getMessage());
+            logger.error("Error closing selector: {}", e.getMessage());
+        }
+
+        if (poolMonitor != null) {
+            poolMonitor.stop();
         }
 
         if (pool != null && !pool.isShutdown()) {
+            logger.info("Waiting for {} active tasks to complete...", activeTasks.get());
             pool.shutdown();
             try {
-                if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
-                    System.out.println("Force-shutting down generator threads...");
+                if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+                    logger.warn("Force-shutting down generator threads after timeout...");
                     pool.shutdownNow();
                 }
             } catch (InterruptedException e) {
                 pool.shutdownNow();
                 Thread.currentThread().interrupt();
             }
-            System.out.println("Generator thread pool stopped.");
+            logger.info("Generator thread pool stopped. Completed tasks: {}", completedTasks.get());
         }
 
-        System.out.println("KeyServer stopped successfully.");
+        logger.info("KeyServer stopped successfully.");
     }
 
     record PairPem(byte[] priv, byte[] cert) {}
+    
+    static class CacheEntry {
+        final CompletableFuture<PairPem> future;
+        final long timestamp;
+        
+        CacheEntry(CompletableFuture<PairPem> future) {
+            this.future = future;
+            this.timestamp = System.currentTimeMillis();
+        }
+        
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > CACHE_TTL_MS;
+        }
+    }
 
     public KeyServer(int port, int genThreads, PrivateKey key, String issuerDN) throws IOException {
         this.port = port;
@@ -81,10 +116,11 @@ public class KeyServer {
         this.serverChannel.configureBlocking(false);
         this.serverChannel.register(selector, SelectionKey.OP_ACCEPT);
         this.pool = Executors.newFixedThreadPool(genThreads);
+        this.poolMonitor = new PoolMonitor(pool, activeTasks, completedTasks, genThreads);
     }
 
     public void start() throws IOException {
-        System.out.println("Server listening on port " + port);
+        logger.info("Server listening on port {}", port);
         while (running.get()) {
             processReady();
             selector.select(500);
@@ -114,7 +150,7 @@ public class KeyServer {
         if (sc == null) return;
         sc.configureBlocking(false);
         sc.register(selector, SelectionKey.OP_READ, new ClientConnection(sc));
-        System.out.println("Accepted " + sc.getRemoteAddress());
+        logger.info("Accepted connection from {}", sc.getRemoteAddress());
     }
 
     private void handleRead(SelectionKey key) {
@@ -141,54 +177,98 @@ public class KeyServer {
             }
 
             String name = new String(data, 0, zero, StandardCharsets.US_ASCII);
-            System.out.println("Request: " + name);
+            
+            // Проверка длины имени
+            if (name.length() > MAX_NAME_LENGTH) {
+                logger.warn("Name too long: {} characters (max: {})", name.length(), MAX_NAME_LENGTH);
+                sendError(c, "Name too long");
+                return;
+            }
+            
+            logger.info("Request: {}", name);
             c.requestedName = name;
             c.readBuffer.clear();
             key.interestOps(0);
 
-            var fut = cache.computeIfAbsent(name, nm -> {
-                var f = new CompletableFuture<PairPem>();
+            // Очистка устаревших записей кэша
+            cleanupExpiredCache();
+
+            var entry = cache.get(name);
+            CompletableFuture<PairPem> fut;
+            
+            if (entry != null && !entry.isExpired()) {
+                fut = entry.future;
+                logger.debug("Using cached result for: {}", name);
+            } else {
+                fut = new CompletableFuture<PairPem>();
+                activeTasks.incrementAndGet();
                 pool.submit(() -> {
                     try {
-                        var kp = CertificateUtils.generateRSAKeyPair(8192);
-                        var cert = CertificateUtils.buildCertificate(nm, kp.getPublic(), issuerKey, issuerDN);
+                        KeyPair kp;
+                        X509Certificate cert;
+                        
+                        // Используем RSA ключи (EC требует совместимый issuer key)
+                        kp = CertificateUtils.generateRSAKeyPair(2048);
+                        cert = CertificateUtils.buildCertificate(name, kp.getPublic(), issuerKey, issuerDN);
+                        
                         var privPem = CertificateUtils.toPem(kp.getPrivate()).getBytes(StandardCharsets.UTF_8);
                         var certPem = CertificateUtils.toPem(cert).getBytes(StandardCharsets.UTF_8);
-                        f.complete(new PairPem(privPem, certPem));
-                        System.out.println("Generated for " + nm);
+                        fut.complete(new PairPem(privPem, certPem));
+                        completedTasks.incrementAndGet();
+                        activeTasks.decrementAndGet();
+                        logger.info("Generated key pair for: {}", name);
                     } catch (Exception e) {
-                        f.completeExceptionally(e);
+                        activeTasks.decrementAndGet();
+                        fut.completeExceptionally(e);
                     }
                 });
-                return f;
-            });
+                cache.put(name, new CacheEntry(fut));
+            }
 
             fut.whenComplete((res, ex) -> {
                 try {
                     ByteBuffer bb;
                     if (ex != null) {
-                        System.err.println("Error generating key for " + c.requestedName + ": " + ex);
-                        byte[] msg = ("ERROR: " + ex).getBytes(StandardCharsets.UTF_8);
-                        bb = ByteBuffer.allocate(4 + msg.length).putInt(msg.length).put(msg);
+                        logger.error("Error generating key for {}: {}", c.requestedName, ex.getMessage());
+                        sendError(c, "Key generation failed: " + ex.getMessage());
                     } else {
-                        System.out.println("Sending key for " + c.requestedName +
-                            " (priv: " + res.priv().length + " bytes, cert: " + res.cert().length + " bytes)");
-                        bb = ByteBuffer.allocate(4 + res.priv().length + 4 + res.cert().length);
+                        logger.info("Sending key for {} (priv: {} bytes, cert: {} bytes)", 
+                            c.requestedName, res.priv().length, res.cert().length);
+                        bb = ByteBuffer.allocate(1 + 4 + res.priv().length + 4 + res.cert().length);
+                        bb.put((byte) 0); // Success status
                         bb.putInt(res.priv().length).put(res.priv());
                         bb.putInt(res.cert().length).put(res.cert());
+                        bb.flip();
+                        c.writeBuffer = bb;
+                        readyToWrite.add(c);
+                        selector.wakeup();
                     }
-                    bb.flip();
-                    c.writeBuffer = bb;
-                    readyToWrite.add(c);
-                    selector.wakeup();
                 } catch (Exception e2) {
-                    System.err.println("Error in whenComplete: " + e2);
-                    e2.printStackTrace();
+                    logger.error("Error in whenComplete: {}", e2.getMessage(), e2);
                 }
             });
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.error("Error handling read: {}", e.getMessage(), e);
         }
+    }
+    
+    private void sendError(ClientConnection c, String message) {
+        try {
+            byte[] msgBytes = message.getBytes(StandardCharsets.UTF_8);
+            ByteBuffer bb = ByteBuffer.allocate(1 + 4 + msgBytes.length);
+            bb.put((byte) 1); // Error status
+            bb.putInt(msgBytes.length).put(msgBytes);
+            bb.flip();
+            c.writeBuffer = bb;
+            readyToWrite.add(c);
+            selector.wakeup();
+        } catch (Exception e) {
+            logger.error("Error sending error message: {}", e.getMessage());
+        }
+    }
+    
+    private void cleanupExpiredCache() {
+        cache.entrySet().removeIf(entry -> entry.getValue().isExpired());
     }
 
     private void handleWrite(SelectionKey key) {
@@ -205,7 +285,7 @@ public class KeyServer {
             if (!buffer.hasRemaining()) {
                 client.writeBuffer = null;
                 try {
-                    System.out.println("Finished sending to " + client.channel.getRemoteAddress());
+                    logger.debug("Finished sending to {}", client.channel.getRemoteAddress());
                 } catch (IOException ignored) {}
                 client.close();
                 key.cancel();
@@ -213,7 +293,7 @@ public class KeyServer {
 
         } catch (IOException e) {
             try {
-                System.err.println("Write error: " + e.getMessage());
+                logger.error("Write error: {}", e.getMessage());
             } catch (Exception ignored) {}
             client.close();
             key.cancel();
