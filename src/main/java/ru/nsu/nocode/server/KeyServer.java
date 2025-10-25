@@ -19,10 +19,9 @@ public class KeyServer {
     private static final Logger logger = LoggerFactory.getLogger(KeyServer.class);
     private static final int MAX_NAME_LENGTH = 255;
     private static final int MAX_CACHE_SIZE = 1000;
-    private static final long CACHE_TTL_MS = 300_000; // 5 minutes
-    
+    private static final long CACHE_TTL_MS = 300_000;
+
     private final int port;
-    private final int genThreads;
     private final PrivateKey issuerKey;
     private final String issuerDN;
     private final Selector selector;
@@ -38,7 +37,7 @@ public class KeyServer {
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final AtomicInteger activeTasks = new AtomicInteger(0);
     private final AtomicInteger completedTasks = new AtomicInteger(0);
-    private PoolMonitor poolMonitor;
+    private final PoolMonitor poolMonitor;
 
     public void shutdown() {
         logger.info("Shutting down KeyServer...");
@@ -90,16 +89,16 @@ public class KeyServer {
     }
 
     record PairPem(byte[] priv, byte[] cert) {}
-    
+
     static class CacheEntry {
         final CompletableFuture<PairPem> future;
         final long timestamp;
-        
+
         CacheEntry(CompletableFuture<PairPem> future) {
             this.future = future;
             this.timestamp = System.currentTimeMillis();
         }
-        
+
         boolean isExpired() {
             return System.currentTimeMillis() - timestamp > CACHE_TTL_MS;
         }
@@ -107,7 +106,6 @@ public class KeyServer {
 
     public KeyServer(int port, int genThreads, PrivateKey key, String issuerDN) throws IOException {
         this.port = port;
-        this.genThreads = genThreads;
         this.issuerKey = key;
         this.issuerDN = issuerDN;
         this.selector = Selector.open();
@@ -177,25 +175,23 @@ public class KeyServer {
             }
 
             String name = new String(data, 0, zero, StandardCharsets.US_ASCII);
-            
-            // Проверка длины имени
+
             if (name.length() > MAX_NAME_LENGTH) {
                 logger.warn("Name too long: {} characters (max: {})", name.length(), MAX_NAME_LENGTH);
                 sendError(c, "Name too long");
                 return;
             }
-            
+
             logger.info("Request: {}", name);
             c.requestedName = name;
             c.readBuffer.clear();
             key.interestOps(0);
 
-            // Очистка устаревших записей кэша
             cleanupExpiredCache();
 
             var entry = cache.get(name);
             CompletableFuture<PairPem> fut;
-            
+
             if (entry != null && !entry.isExpired()) {
                 fut = entry.future;
                 logger.debug("Using cached result for: {}", name);
@@ -206,11 +202,10 @@ public class KeyServer {
                     try {
                         KeyPair kp;
                         X509Certificate cert;
-                        
-                        // Используем RSA ключи (EC требует совместимый issuer key)
+
                         kp = CertificateUtils.generateRSAKeyPair(2048);
                         cert = CertificateUtils.buildCertificate(name, kp.getPublic(), issuerKey, issuerDN);
-                        
+
                         var privPem = CertificateUtils.toPem(kp.getPrivate()).getBytes(StandardCharsets.UTF_8);
                         var certPem = CertificateUtils.toPem(cert).getBytes(StandardCharsets.UTF_8);
                         fut.complete(new PairPem(privPem, certPem));
@@ -232,10 +227,10 @@ public class KeyServer {
                         logger.error("Error generating key for {}: {}", c.requestedName, ex.getMessage());
                         sendError(c, "Key generation failed: " + ex.getMessage());
                     } else {
-                        logger.info("Sending key for {} (priv: {} bytes, cert: {} bytes)", 
+                        logger.info("Sending key for {} (priv: {} bytes, cert: {} bytes)",
                             c.requestedName, res.priv().length, res.cert().length);
                         bb = ByteBuffer.allocate(1 + 4 + res.priv().length + 4 + res.cert().length);
-                        bb.put((byte) 0); // Success status
+                        bb.put((byte) 0);
                         bb.putInt(res.priv().length).put(res.priv());
                         bb.putInt(res.cert().length).put(res.cert());
                         bb.flip();
@@ -251,12 +246,12 @@ public class KeyServer {
             logger.error("Error handling read: {}", e.getMessage(), e);
         }
     }
-    
+
     private void sendError(ClientConnection c, String message) {
         try {
             byte[] msgBytes = message.getBytes(StandardCharsets.UTF_8);
             ByteBuffer bb = ByteBuffer.allocate(1 + 4 + msgBytes.length);
-            bb.put((byte) 1); // Error status
+            bb.put((byte) 1);
             bb.putInt(msgBytes.length).put(msgBytes);
             bb.flip();
             c.writeBuffer = bb;
@@ -266,7 +261,7 @@ public class KeyServer {
             logger.error("Error sending error message: {}", e.getMessage());
         }
     }
-    
+
     private void cleanupExpiredCache() {
         cache.entrySet().removeIf(entry -> entry.getValue().isExpired());
     }

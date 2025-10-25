@@ -13,7 +13,7 @@ public class Main {
             System.err.println("""
                     Usage:
                       java ru.nsu.nocode.Main server <port> <threads> <issuer.pem> <issuerDN>
-                      java ru.nsu.nocode.Main client <host> <port> <name> [--delay N] [--exit-before-read]
+                      java ru.nsu.nocode.Main client <host> <port> <name> [--delay N] [--preexit]
                     """);
             System.exit(1);
         }
