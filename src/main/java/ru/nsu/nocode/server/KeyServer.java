@@ -27,12 +27,12 @@ public class KeyServer {
     private final Selector selector;
     private final ServerSocketChannel serverChannel;
     private final ExecutorService pool;
-    private final Map<String, CacheEntry> cache = Collections.synchronizedMap(new LinkedHashMap<String, CacheEntry>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
+    // Почитать устройство synchronizedMap
+    private final Map<String, CacheEntry> cache = new ConcurrentHashMap<String, CacheEntry>() {
+        private boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
             return size() > MAX_CACHE_SIZE;
         }
-    });
+    };
     private final ConcurrentLinkedQueue<ClientConnection> readyToWrite = new ConcurrentLinkedQueue<>();
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final AtomicInteger activeTasks = new AtomicInteger(0);
