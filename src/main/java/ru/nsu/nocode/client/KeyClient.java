@@ -13,7 +13,7 @@ import java.util.Map;
 public class KeyClient {
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
-            System.err.println("Usage: KeyClient <host> <port> <name> [--delay N] [--exit-before-read]");
+            System.err.println("Usage: KeyClient <host> <port> <name> [--delay N] [--preexit]");
             return;
         }
         String host = args[0];
@@ -24,7 +24,7 @@ public class KeyClient {
         for (int i = 3; i < args.length; i++) {
             if ("--delay".equals(args[i]) && i + 1 < args.length)
                 delay = Integer.parseInt(args[++i]);
-            else if ("--exit-before-read".equals(args[i]))
+            else if ("--preexit".equals(args[i]))
                 exitEarly = true;
         }
 
@@ -38,22 +38,21 @@ public class KeyClient {
             os.flush();
             System.out.println("Sent: " + name);
 
-            if (delay > 0) {
-                System.out.println("Delaying " + delay + "s...");
-                Thread.sleep(delay * 1000L);
-            }
             if (exitEarly) {
                 System.out.println("Exiting early.");
                 return;
             }
+            if (delay > 0) {
+                System.out.println("Delaying " + delay + "s...");
+                Thread.sleep(delay * 1000L);
+            }
 
-            // Читаем статус (1 байт)
+
             byte[] statusBytes = is.readNBytes(1);
             if (statusBytes.length < 1) throw new IOException("Incomplete status");
             byte status = statusBytes[0];
-            
+
             if (status == 1) {
-                // Ошибка
                 byte[] lenBytes = is.readNBytes(4);
                 if (lenBytes.length < 4) throw new IOException("Incomplete error header");
                 int errorLen = ByteBuffer.wrap(lenBytes).getInt();
@@ -62,7 +61,6 @@ public class KeyClient {
                 System.err.println("Server error: " + errorMsg);
                 return;
             } else if (status == 0) {
-                // Успех
                 byte[] buf4 = is.readNBytes(4);
                 if (buf4.length < 4) throw new IOException("Incomplete header");
                 int privLen = ByteBuffer.wrap(buf4).getInt();
