@@ -1,0 +1,2 @@
+(require '[task-c3.core :refer :all]) (take 10 (pfilter even? (range) 1000))
+(require '[task-c3.core :refer :all]) (count (take 100 (pfilter even? (range) 1000)))
